@@ -173,7 +173,7 @@ public:
     void syncState(KeySym sym = FcitxKey_None);
     void updatePreedit();
 
-    // Direct commit mode: commit text immediately without preedit
+    // Direct commit mode: commit text immediately without preedit.
     bool isDirectCommit() const;
     bool isXIMFrontend() const;
     bool hasActiveWord() const { return committedChars_ > 0; }
@@ -181,7 +181,7 @@ public:
     void directCommitPreedit(KeyEvent &keyEvent);
     void directCommitSync(KeySym sym = FcitxKey_None);
     void forwardBackspaces(int n);
-    void flushPendingCommit();
+    void commitDeferred();
 
     void eraseChars(int num_chars) {
         int i;
@@ -202,8 +202,9 @@ public:
     }
 
     void reset() {
-        flushPendingCommit();
+        commitDeferred();
         pendingBackspaces_ = 0;
+        staleBackspaces_ = 0;
         committedChars_ = 0;
         uic_.resetBuf();
         preeditStr_.clear();
@@ -386,8 +387,9 @@ private:
     bool autoCommit_ = false;
     KeySym lastShiftPressed_ = FcitxKey_None;
     int committedChars_ = 0;
-    int pendingBackspaces_ = 0;
-    std::string pendingCommitText_;
+    int pendingBackspaces_ = 0;  // BSes awaiting XIM re-entry
+    int staleBackspaces_ = 0;   // leftover BSes from prior ops
+    std::string deferredText_;   // text to commit after BSes land
 };
 
 UnikeyEngine::UnikeyEngine(Instance *instance)
@@ -652,12 +654,17 @@ void UnikeyState::preedit(KeyEvent &keyEvent) {
         syncState(sym);
 
         // commit string: if need
-        if (!preeditStr_.empty()) {
-            if (preeditStr_.back() == sym && isWordBreakSym(sym)) {
-                commit();
-                keyEvent.filterAndAccept();
-                return;
+        if (!preeditStr_.empty() && isWordBreakSym(sym)) {
+            // When the engine modifies the word (e.g. tone
+            // repositioning), syncState appends only the corrected
+            // word — the word break char is not included.  Append
+            // it so the committed string contains the separator.
+            if (preeditStr_.back() != static_cast<char>(sym)) {
+                preeditStr_.append(utf8::UCS4ToUTF8(sym));
             }
+            commit();
+            keyEvent.filterAndAccept();
+            return;
         }
         // end commit string
 
@@ -855,11 +862,8 @@ void UnikeyState::forwardBackspaces(int n) {
         for (int i = 0; i < n; i++) {
             ic_->forwardKey(Key(FcitxKey_BackSpace));
         }
-        // On XIM, forwarded BSes re-enter the IM as key events.
-        // Track them so we can defer commit until all are processed.
-        // On Wayland, forwarded BSes don't re-enter — both forwardKey
-        // and commitString go in the same Wayland flush, so the
-        // compositor delivers them in order. No tracking needed.
+        // On XIM, forwarded BSes re-enter the IM; track them so
+        // we can defer the commit until they are all processed.
         if (isXIMFrontend()) {
             pendingBackspaces_ += n;
         }
@@ -895,14 +899,9 @@ void UnikeyState::directCommitSync(KeySym sym) {
 
     if (!newText.empty()) {
         if (pendingBackspaces_ > 0) {
-            // XIM: forwarded BSes will re-enter the IM. Defer commit
-            // until all re-entered BSes are processed.
-            pendingCommitText_ = std::move(newText);
+            // Defer until forwarded BSes have re-entered on XIM.
+            deferredText_ = std::move(newText);
         } else {
-            // Immediate commit:
-            // - deleteSurroundingText + commitString: atomic batch
-            // - Wayland forwardKey + commitString: same flush, ordered
-            // - No deletion: nothing to wait for
             ic_->commitString(newText);
             committedChars_ +=
                 static_cast<int>(utf8::length(newText));
@@ -910,30 +909,39 @@ void UnikeyState::directCommitSync(KeySym sym) {
     }
 }
 
-void UnikeyState::flushPendingCommit() {
-    if (!pendingCommitText_.empty()) {
-        ic_->commitString(pendingCommitText_);
-        committedChars_ +=
-            static_cast<int>(utf8::length(pendingCommitText_));
-        pendingCommitText_.clear();
+void UnikeyState::commitDeferred() {
+    if (deferredText_.empty()) {
+        return;
     }
+    ic_->commitString(deferredText_);
+    committedChars_ += static_cast<int>(utf8::length(deferredText_));
+    deferredText_.clear();
 }
 
 void UnikeyState::directCommitKeyEvent(KeyEvent &keyEvent) {
     auto sym = keyEvent.rawKey().sym();
 
-    // Skip forwarded backspaces re-entering via XIM.
-    // Don't filterAndAccept — let the BS reach the app for deletion.
+    // On XIM, forwarded BSes re-enter the IM.  Consume them silently.
     if (sym == FcitxKey_BackSpace && pendingBackspaces_ > 0) {
         pendingBackspaces_--;
         if (pendingBackspaces_ == 0) {
-            // All forwarded BSes processed, safe to commit now.
-            flushPendingCommit();
+            commitDeferred();
         }
         return;
     }
+    if (sym == FcitxKey_BackSpace && staleBackspaces_ > 0) {
+        staleBackspaces_--;
+        return;
+    }
 
-    flushPendingCommit();
+    // Promote unfinished pending BSes to stale so late re-entries
+    // are still consumed rather than treated as user backspaces.
+    staleBackspaces_ += pendingBackspaces_;
+    pendingBackspaces_ = 0;
+    if (staleBackspaces_ > MAX_LENGTH_VNWORD) {
+        staleBackspaces_ = 0;
+    }
+    commitDeferred();
     directCommitPreedit(keyEvent);
 
     if (sym >= FcitxKey_space && sym <= FcitxKey_asciitilde) {
