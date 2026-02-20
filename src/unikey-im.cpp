@@ -20,7 +20,6 @@
 #include <cstring>
 #include <fcitx-config/iniparser.h>
 #include <fcitx-utils/capabilityflags.h>
-#include <fcitx-utils/event.h>
 #include <fcitx-utils/charutils.h>
 #include <fcitx-utils/fs.h>
 #include <fcitx-utils/i18n.h>
@@ -183,7 +182,6 @@ public:
     void directCommitSync(KeySym sym = FcitxKey_None);
     void forwardBackspaces(int n);
     void flushPendingCommit();
-    void schedulePendingCommit(std::string text);
 
     void eraseChars(int num_chars) {
         int i;
@@ -205,6 +203,7 @@ public:
 
     void reset() {
         flushPendingCommit();
+        pendingBackspaces_ = 0;
         committedChars_ = 0;
         uic_.resetBuf();
         preeditStr_.clear();
@@ -389,7 +388,6 @@ private:
     int committedChars_ = 0;
     int pendingBackspaces_ = 0;
     std::string pendingCommitText_;
-    std::unique_ptr<EventSourceTime> commitTimer_;
 };
 
 UnikeyEngine::UnikeyEngine(Instance *instance)
@@ -899,7 +897,7 @@ void UnikeyState::directCommitSync(KeySym sym) {
         if (pendingBackspaces_ > 0) {
             // XIM: forwarded BSes will re-enter the IM. Defer commit
             // until all re-entered BSes are processed.
-            schedulePendingCommit(std::move(newText));
+            pendingCommitText_ = std::move(newText);
         } else {
             // Immediate commit:
             // - deleteSurroundingText + commitString: atomic batch
@@ -913,32 +911,11 @@ void UnikeyState::directCommitSync(KeySym sym) {
 }
 
 void UnikeyState::flushPendingCommit() {
-    if (commitTimer_) {
-        commitTimer_->setEnabled(false);
-    }
     if (!pendingCommitText_.empty()) {
         ic_->commitString(pendingCommitText_);
         committedChars_ +=
             static_cast<int>(utf8::length(pendingCommitText_));
         pendingCommitText_.clear();
-    }
-}
-
-void UnikeyState::schedulePendingCommit(std::string text) {
-    pendingCommitText_ = std::move(text);
-    uint64_t t = now(CLOCK_MONOTONIC) + 20000;
-    if (!commitTimer_) {
-        commitTimer_ =
-            engine_->instance()->eventLoop().addTimeEvent(
-                CLOCK_MONOTONIC, t, 0,
-                [this](EventSourceTime *source, uint64_t) {
-                    flushPendingCommit();
-                    source->setEnabled(false);
-                    return true;
-                });
-    } else {
-        commitTimer_->setTime(t);
-        commitTimer_->setEnabled(true);
     }
 }
 
@@ -955,7 +932,6 @@ void UnikeyState::directCommitKeyEvent(KeyEvent &keyEvent) {
         }
         return;
     }
-    pendingBackspaces_ = 0;
 
     flushPendingCommit();
     directCommitPreedit(keyEvent);
