@@ -390,6 +390,7 @@ private:
     int pendingBackspaces_ = 0;  // BSes awaiting XIM re-entry
     int staleBackspaces_ = 0;   // leftover BSes from prior ops
     std::string deferredText_;   // text to commit after BSes land
+    bool usedDeleteSurrounding_ = false;
 };
 
 UnikeyEngine::UnikeyEngine(Instance *instance)
@@ -855,18 +856,19 @@ void UnikeyState::forwardBackspaces(int n) {
     if (n <= 0) {
         return;
     }
-    if (ic_->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
-        !ic_->capabilityFlags().test(CapabilityFlag::Terminal)) {
+    if (!isXIMFrontend() &&
+        ic_->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
         ic_->deleteSurroundingText(-n, n);
+        usedDeleteSurrounding_ = true;
     } else {
+        // XIM or D-Bus without SurroundingText: forward key events.
         for (int i = 0; i < n; i++) {
             ic_->forwardKey(Key(FcitxKey_BackSpace));
         }
-        // On XIM, forwarded BSes re-enter the IM; track them so
-        // we can defer the commit until they are all processed.
         if (isXIMFrontend()) {
             pendingBackspaces_ += n;
         }
+        usedDeleteSurrounding_ = false;
     }
 }
 
@@ -898,10 +900,15 @@ void UnikeyState::directCommitSync(KeySym sym) {
     }
 
     if (!newText.empty()) {
-        if (pendingBackspaces_ > 0) {
-            // Defer until forwarded BSes have re-entered on XIM.
+        if (delChars > 0 && !usedDeleteSurrounding_) {
+            // forwardKey(BS) was used (XIM or fallback).  Defer commit
+            // until BSes are processed — on XIM they re-enter and are
+            // consumed; on non-XIM the synthetic BS may not be
+            // processed before a commitString.
             deferredText_ = std::move(newText);
         } else {
+            // deleteSurroundingText was used (synchronous) or no
+            // backspaces needed (delChars == 0).  Commit immediately.
             ic_->commitString(newText);
             committedChars_ +=
                 static_cast<int>(utf8::length(newText));
@@ -921,12 +928,12 @@ void UnikeyState::commitDeferred() {
 void UnikeyState::directCommitKeyEvent(KeyEvent &keyEvent) {
     auto sym = keyEvent.rawKey().sym();
 
-    // On XIM, forwarded BSes re-enter the IM.  Consume them silently.
+    // On XIM, forwarded BSes re-enter the IM.  Consume them but
+    // do NOT commit deferred text here — the BackSpace hasn't been
+    // processed by the app yet (it passes through after we return).
+    // Deferred text will be committed on the next real key event.
     if (sym == FcitxKey_BackSpace && pendingBackspaces_ > 0) {
         pendingBackspaces_--;
-        if (pendingBackspaces_ == 0) {
-            commitDeferred();
-        }
         return;
     }
     if (sym == FcitxKey_BackSpace && staleBackspaces_ > 0) {
@@ -1025,7 +1032,8 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
             if (isWordAutoCommit(sym)) {
                 uic_.putChar(sym);
                 autoCommit_ = true;
-                ic_->commitString(utf8::UCS4ToUTF8(sym));
+                auto ch = utf8::UCS4ToUTF8(sym);
+                ic_->commitString(ch);
                 committedChars_++;
                 keyEvent.filterAndAccept();
                 return;
@@ -1039,7 +1047,8 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
             uic_.isAtWordBeginning() &&
             (sym == FcitxKey_w || sym == FcitxKey_W)) {
             uic_.putChar(sym);
-            ic_->commitString(sym == FcitxKey_w ? "w" : "W");
+            auto ch = std::string(sym == FcitxKey_w ? "w" : "W");
+            ic_->commitString(ch);
             committedChars_++;
             keyEvent.filterAndAccept();
             return;
