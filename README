@@ -2,8 +2,41 @@ Unikey (Vietnamese Input Method) engine support for Fcitx
 
 Released under mixed GPLv2+
 
-Install:
-$ mkdir build && cd build
-$ cmake -DCMAKE_INSTALL_PREFIX=[prefix to fcitx5] ..
-$ make
-# make install
+Dependencies:
+- CMake >= 3.6
+- ECM (Extra CMake Modules) >= 1.0.0
+- Fcitx5 >= 5.1.13
+- Gettext
+- Qt6 (Core, Gui, Widgets) — optional, for macro/keymap editors
+- Fcitx5Qt6WidgetsAddons >= 5.0.12 — optional, required if Qt is enabled
+
+Build and install with Ninja (default, with Qt editors and tests):
+$ cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr
+$ ninja -C build
+# ninja -C build install
+
+Build and install with Make:
+$ cmake -B build -DCMAKE_INSTALL_PREFIX=/usr
+$ make -C build
+# make -C build install
+
+Minimal build (no Qt editors, no tests):
+$ cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr -DENABLE_QT=Off -DENABLE_TEST=Off
+$ ninja -C build
+# ninja -C build install
+
+Build with coverage:
+$ cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr -DENABLE_COVERAGE=On
+$ ninja -C build
+$ ninja -C build coverage
+
+CMake options:
+  -DENABLE_QT=On/Off        Enable Qt based macro/keymap editor (default: On)
+  -DENABLE_TEST=On/Off       Build tests (default: On)
+  -DENABLE_COVERAGE=On/Off   Build with gcov coverage support (default: Off)
+
+Run tests:
+$ ctest --test-dir build
+
+Uninstall:
+$ ninja -C build uninstall
