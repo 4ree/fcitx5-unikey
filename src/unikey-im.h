@@ -70,6 +70,7 @@ public:
     void updateUI(InputContext *ic);
     void updateMacroAction(InputContext *ic);
     void updateSpellAction(InputContext *ic);
+    void updateDirectCommitAction(InputContext *ic);
     void updateCharsetAction(InputContext *ic);
     void updateInputMethodAction(InputContext *ic);
 
@@ -102,6 +103,7 @@ private:
     std::unique_ptr<Menu> charsetMenu_;
     std::unique_ptr<SimpleAction> spellCheckAction_;
     std::unique_ptr<SimpleAction> macroAction_;
+    std::unique_ptr<SimpleAction> directCommitAction_;
     std::vector<ScopedConnection> connections_;
     std::vector<std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>>
         eventWatchers_;

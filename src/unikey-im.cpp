@@ -316,7 +316,8 @@ public:
 
     // After rebuild preedit, make sure nothing else calls commit
     void rebuildPreedit() {
-        if (!*engine_->config().modifySurroundingText ||
+        if (isDirectCommit() ||
+            !*engine_->config().modifySurroundingText ||
             *engine_->config().oc != UkConv::XUTF8) {
             return;
         }
@@ -487,6 +488,19 @@ UnikeyEngine::UnikeyEngine(Instance *instance)
         }));
     uiManager.registerAction("unikey-macro", macroAction_.get());
 
+    directCommitAction_ = std::make_unique<SimpleAction>();
+    directCommitAction_->setLongText(_("Direct Commit"));
+    directCommitAction_->setCheckable(true);
+    connections_.emplace_back(
+        directCommitAction_->connect<SimpleAction::Activated>(
+            [this](InputContext *ic) {
+                config_.directCommit.setValue(!*config_.directCommit);
+                safeSaveAsIni(config_, "conf/unikey.conf");
+                updateDirectCommitAction(ic);
+            }));
+    uiManager.registerAction("unikey-direct-commit",
+                             directCommitAction_.get());
+
     eventWatchers_.emplace_back(instance_->watchEvent(
         EventType::InputContextSurroundingTextUpdated,
         EventWatcherPhase::PostInputMethod, [this](Event &event) {
@@ -508,6 +522,7 @@ void UnikeyEngine::activate(const InputMethodEntry & /*entry*/,
     statusArea.addAction(StatusGroup::InputMethod, charsetAction_.get());
     statusArea.addAction(StatusGroup::InputMethod, spellCheckAction_.get());
     statusArea.addAction(StatusGroup::InputMethod, macroAction_.get());
+    statusArea.addAction(StatusGroup::InputMethod, directCommitAction_.get());
 
     auto *ic = event.inputContext();
     updateUI(ic);
@@ -787,11 +802,20 @@ void UnikeyEngine::updateCharsetAction(InputContext *ic) {
     charsetAction_->update(ic);
 }
 
+void UnikeyEngine::updateDirectCommitAction(InputContext *ic) {
+    directCommitAction_->setChecked(*config_.directCommit);
+    directCommitAction_->setShortText(*config_.directCommit
+                                          ? _("Direct Commit Enabled")
+                                          : _("Direct Commit Disabled"));
+    directCommitAction_->update(ic);
+}
+
 void UnikeyEngine::updateUI(InputContext *ic) {
     updateInputMethodAction(ic);
     updateCharsetAction(ic);
     updateMacroAction(ic);
     updateSpellAction(ic);
+    updateDirectCommitAction(ic);
 }
 
 void UnikeyState::handleIgnoredKey() {
@@ -860,8 +884,7 @@ void UnikeyState::updatePreedit() {
 }
 
 bool UnikeyState::isDirectCommit() const {
-    return *engine_->config().directCommit &&
-           !*engine_->config().modifySurroundingText;
+    return *engine_->config().directCommit;
 }
 
 bool UnikeyState::isXIMFrontend() const {
