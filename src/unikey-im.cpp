@@ -895,21 +895,27 @@ void UnikeyState::forwardBackspaces(int n) {
     if (n <= 0) {
         return;
     }
-    // Always forward BackSpace key events rather than using
-    // deleteSurroundingText.  Some apps (e.g. LibreOffice on Wayland)
-    // report SurroundingText capability but silently ignore
-    // delete_surrounding_text from the IM, causing the new committed text
-    // to be appended on top of the old one (e.g. "coó" instead of "có").
-    // Forwarded BS events go through the virtual keyboard and are
-    // processed correctly everywhere; the deferred-commit path in
-    // directCommitSync ensures the commit lands after the BSes.
-    for (int i = 0; i < n; i++) {
-        ic_->forwardKey(Key(FcitxKey_BackSpace));
+    if (!isXIMFrontend() &&
+        ic_->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+        // Native Wayland apps (text-input-v3) and D-Bus apps with
+        // SurroundingText use deleteSurroundingText synchronously.
+        // Note: some apps (e.g. LibreOffice on Wayland) advertise
+        // SurroundingText but ignore delete_surrounding_text — those
+        // will remain broken; this is a bug in those apps.
+        ic_->deleteSurroundingText(-n, n);
+        usedDeleteSurrounding_ = true;
+    } else {
+        // XIM or apps without SurroundingText: forward BackSpace events.
+        // On XIM, forwarded BSes re-enter the IM and are consumed via
+        // pendingBackspaces_; deferred commit lands after they pass through.
+        for (int i = 0; i < n; i++) {
+            ic_->forwardKey(Key(FcitxKey_BackSpace));
+        }
+        if (isXIMFrontend()) {
+            pendingBackspaces_ += n;
+        }
+        usedDeleteSurrounding_ = false;
     }
-    if (isXIMFrontend()) {
-        pendingBackspaces_ += n;
-    }
-    usedDeleteSurrounding_ = false;
 }
 
 void UnikeyState::directCommitSync(KeySym sym) {
