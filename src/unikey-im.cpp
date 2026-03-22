@@ -206,6 +206,7 @@ public:
         pendingBackspaces_ = 0;
         staleBackspaces_ = 0;
         committedChars_ = 0;
+        autoCommit_ = false;
         uic_.resetBuf();
         preeditStr_.clear();
         updatePreedit();
@@ -724,7 +725,8 @@ void UnikeyEngine::reset(const InputMethodEntry & /*entry*/,
             state->mayRebuildStateFromSurroundingText_ = true;
         }
     }
-    if (event.type() == EventType::InputContextFocusOut) {
+    if (event.type() == EventType::InputContextFocusOut ||
+        event.type() == EventType::InputContextSwitchInputMethod) {
         state->suppressNextRebuild_ = true;
     }
 }
