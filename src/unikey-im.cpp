@@ -1032,6 +1032,7 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
         directCommitSync();
         committedChars_ = 0;
         uic_.resetBuf();
+        mayRebuildStateFromSurroundingText_ = false;
         return;
     }
     if (state.test(KeyState::Super)) {
@@ -1046,6 +1047,7 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
         if (uic_.backspaces() == 0 || committedChars_ == 0) {
             committedChars_ = 0;
             uic_.resetBuf();
+            mayRebuildStateFromSurroundingText_ = false;
             return;
         }
         if (committedChars_ <= uic_.backspaces()) {
@@ -1054,6 +1056,10 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
         directCommitSync();
         if (uic_.bufChars() > 0) {
             autoCommit_ = false;
+        } else if (uic_.isAtWordBeginning()) {
+            // Word fully erased; suppress rebuild so stale surrounding-text
+            // doesn't re-enter the deleted word on the next key event.
+            mayRebuildStateFromSurroundingText_ = false;
         }
         keyEvent.filterAndAccept();
         return;
@@ -1063,6 +1069,7 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
         directCommitSync();
         committedChars_ = 0;
         uic_.resetBuf();
+        mayRebuildStateFromSurroundingText_ = false;
         return;
     }
     if (sym >= FcitxKey_space && sym <= FcitxKey_asciitilde) {
@@ -1109,9 +1116,15 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
 
         directCommitSync(sym);
 
-        if (committedChars_ > 0 && isWordBreakSym(sym)) {
-            committedChars_ = 0;
-            uic_.resetBuf();
+        if (isWordBreakSym(sym)) {
+            // Stale surrounding-text from commits made before this word-break
+            // hasn't reached us yet; suppress rebuild so the engine doesn't
+            // incorrectly re-enter the just-committed word on the next key.
+            mayRebuildStateFromSurroundingText_ = false;
+            if (committedChars_ > 0) {
+                committedChars_ = 0;
+                uic_.resetBuf();
+            }
         }
 
         keyEvent.filterAndAccept();
@@ -1123,6 +1136,7 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
     directCommitSync();
     committedChars_ = 0;
     uic_.resetBuf();
+    mayRebuildStateFromSurroundingText_ = false;
 }
 
 } // namespace fcitx
