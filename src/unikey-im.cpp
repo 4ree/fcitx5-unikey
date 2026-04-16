@@ -383,12 +383,10 @@ public:
     }
 
     bool mayRebuildStateFromSurroundingText_ = false;
-    // Suppresses the next rebuild-from-surrounding-text triggered by
-    // activate() or InputContextReset.  Starts true so the first focus
-    // in any app (including LibreOffice, which has rich surrounding text)
-    // doesn't contaminate the engine with unrelated existing text.
-    // Set again on every FocusOut so returning to an app always starts
-    // with a clean engine rather than rebuilding from stale context.
+    // Suppresses the next rebuild-from-surrounding-text.  Starts true and
+    // is re-armed on every activate() (FocusIn) and FocusOut so that stale
+    // surrounding text never contaminates the engine on the first keypress
+    // after a focus change — even when the compositor skips FocusOut.
     bool suppressNextRebuild_ = true;
 
 private:
@@ -530,6 +528,12 @@ void UnikeyEngine::activate(const InputMethodEntry & /*entry*/,
     updateUI(ic);
     auto *state = ic->propertyFor(&factory_);
     if (ic->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+        // Always suppress the first rebuild on focus-in. If FocusOut was
+        // missed (Wayland/X11 timing, or IM apps that don't emit it before
+        // FocusIn), suppressNextRebuild_ may still be false from the
+        // previous session, allowing stale surrounding text (e.g. chat
+        // history) to contaminate the engine on the very first keypress.
+        state->suppressNextRebuild_ = true;
         state->mayRebuildStateFromSurroundingText_ = true;
     }
 }
