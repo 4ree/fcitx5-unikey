@@ -176,7 +176,10 @@ public:
     // Direct commit mode: commit text immediately without preedit.
     bool isDirectCommit() const;
     bool isXIMFrontend() const;
-    bool hasActiveWord() const { return committedChars_ > 0; }
+    bool hasActiveWord() const { return !committedText_.empty(); }
+    int committedChars() const {
+        return static_cast<int>(utf8::length(committedText_));
+    }
     void directCommitKeyEvent(KeyEvent &keyEvent);
     void directCommitPreedit(KeyEvent &keyEvent);
     void directCommitSync(KeySym sym = FcitxKey_None);
@@ -201,11 +204,27 @@ public:
         preeditStr_.erase(i + 1);
     }
 
+    // Remove the last num_chars UTF-8 glyphs from committedText_.
+    void popCommitted(int num_chars) {
+        if (num_chars <= 0) {
+            return;
+        }
+        int k = num_chars;
+        int i;
+        for (i = committedText_.length() - 1; i >= 0 && k > 0; i--) {
+            unsigned char c = committedText_.at(i);
+            if (c < (unsigned char)'\x80' || c >= (unsigned char)'\xC0') {
+                k--;
+            }
+        }
+        committedText_.erase(i + 1);
+    }
+
     void reset() {
         commitDeferred();
         pendingBackspaces_ = 0;
         staleBackspaces_ = 0;
-        committedChars_ = 0;
+        committedText_.clear();
         autoCommit_ = false;
         mayRebuildStateFromSurroundingText_ = false;
         uic_.resetBuf();
@@ -301,15 +320,16 @@ public:
         }
 
         auto rebuildLen = std::distance(start, end);
-        FCITX_UNIKEY_DEBUG()
-            << "Rebuild surrounding with: \""
-            << std::string_view(&*start, rebuildLen) << "\"";
+        // Capture the rebuilt text before the loop consumes `start`; these
+        // are the glyphs already on screen that the engine is adopting.
+        std::string rebuilt(&*start, rebuildLen);
+        FCITX_UNIKEY_DEBUG() << "Rebuild surrounding with: \"" << rebuilt << "\"";
         for (; start != end; ++start) {
             uic_.putChar(*start);
             autoCommit_ = true;
         }
         if (isDirectCommit()) {
-            committedChars_ = static_cast<int>(rebuildLen);
+            committedText_ = std::move(rebuilt);
             // Don't set autoCommit_ — rebuilt chars must go through
             // filter() so VNI digits are processed as modifiers.
             autoCommit_ = false;
@@ -397,7 +417,12 @@ private:
     std::string preeditStr_;
     bool autoCommit_ = false;
     KeySym lastShiftPressed_ = FcitxKey_None;
-    int committedChars_ = 0;
+    // The actual glyphs currently on screen for the in-progress word.
+    // Single source of truth for the app-facing buffer: its UTF-8 glyph
+    // count replaces the old committedChars_ counter, and holding the real
+    // text lets directCommitSync() diff the engine's delete/re-emit against
+    // what is really displayed (see directCommitSync).
+    std::string committedText_;
     int pendingBackspaces_ = 0;  // BSes awaiting XIM re-entry
     int staleBackspaces_ = 0;   // leftover BSes from prior ops
     std::string deferredText_;   // text to commit after BSes land
@@ -713,9 +738,9 @@ void UnikeyEngine::reset(const InputMethodEntry & /*entry*/,
                          InputContextEvent &event) {
     auto *state = event.inputContext()->propertyFor(&factory_);
     // In direct commit mode, preserve engine state on app-triggered
-    // resets only when mid-word (committedChars_ > 0). The committed
+    // resets only when mid-word (committedText_ non-empty). The committed
     // text is still on screen and the engine must stay in sync for
-    // VNI modifiers to work. At word boundaries (committedChars_ == 0),
+    // VNI modifiers to work. At word boundaries (committedText_ empty),
     // allow the reset to proceed normally to avoid buffer accumulation.
     // Exception: FocusOut means the user switched away; always reset so
     // the engine doesn't carry stale state into the next session.
@@ -939,26 +964,63 @@ void UnikeyState::directCommitSync(KeySym sym) {
         newText = utf8::UCS4ToUTF8(sym);
     }
 
-    int delChars = (bs < committedChars_) ? bs : committedChars_;
-    committedChars_ -= delChars;
+    int avail = committedChars();
+    int delChars = (bs < avail) ? bs : avail;
 
-    if (delChars > 0) {
-        forwardBackspaces(delChars);
+    // The engine reports "delete delChars glyphs from the end, then emit
+    // newText", but it frequently re-emits leading glyphs unchanged — e.g.
+    // backspacing 't' from "việt" reports delete "ệt" + emit "ệ".  Diff
+    // newText against the tail we actually committed and skip the common
+    // prefix, so we only forward the backspaces and re-emit the part that
+    // truly changed.  Without this the whole cluster is deleted while the
+    // re-emit is deferred to the next keystroke, which looks like backspace
+    // removing too many characters.
+    int effDel = delChars;
+    std::string_view emitText = newText;
+    if (delChars > 0 && delChars <= avail) {
+        auto tailBegin = utf8::nextNChar(committedText_.cbegin(), avail - delChars);
+        std::string_view tail(&*tailBegin,
+                              std::distance(tailBegin, committedText_.cend()));
+        size_t tOff = 0;
+        size_t nOff = 0;
+        int common = 0;
+        while (common < delChars && nOff < newText.size()) {
+            auto tLen = utf8::ncharByteLength(tail.begin() + tOff, 1);
+            auto nLen = utf8::ncharByteLength(newText.begin() + nOff, 1);
+            if (tLen <= 0 || nLen <= 0 ||
+                tail.substr(tOff, tLen) != emitText.substr(nOff, nLen)) {
+                break;
+            }
+            tOff += tLen;
+            nOff += nLen;
+            ++common;
+        }
+        effDel = delChars - common;
+        emitText = emitText.substr(nOff);
     }
 
-    if (!newText.empty()) {
-        if (delChars > 0 && !usedDeleteSurrounding_) {
+    // Drop the glyphs that are actually being removed from the screen; the
+    // common prefix stays. committedText_ now mirrors the post-deletion
+    // on-screen text. The re-emitted suffix is appended once it lands
+    // (immediately below, or in commitDeferred()).
+    popCommitted(effDel);
+
+    if (effDel > 0) {
+        forwardBackspaces(effDel);
+    }
+
+    if (!emitText.empty()) {
+        if (effDel > 0 && !usedDeleteSurrounding_) {
             // forwardKey(BS) was used (XIM or fallback).  Defer commit
             // until BSes are processed — on XIM they re-enter and are
             // consumed; on non-XIM the synthetic BS may not be
             // processed before a commitString.
-            deferredText_ = std::move(newText);
+            deferredText_ = std::string(emitText);
         } else {
             // deleteSurroundingText was used (synchronous) or no
-            // backspaces needed (delChars == 0).  Commit immediately.
-            ic_->commitString(newText);
-            committedChars_ +=
-                static_cast<int>(utf8::length(newText));
+            // backspaces needed (effDel == 0).  Commit immediately.
+            ic_->commitString(std::string(emitText));
+            committedText_.append(emitText);
         }
     }
 }
@@ -968,7 +1030,7 @@ void UnikeyState::commitDeferred() {
         return;
     }
     ic_->commitString(deferredText_);
-    committedChars_ += static_cast<int>(utf8::length(deferredText_));
+    committedText_.append(deferredText_);
     deferredText_.clear();
 }
 
@@ -1034,7 +1096,7 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
         (sym >= FcitxKey_KP_Home && sym <= FcitxKey_KP_Delete)) {
         uic_.filter(0);
         directCommitSync();
-        committedChars_ = 0;
+        committedText_.clear();
         uic_.resetBuf();
         mayRebuildStateFromSurroundingText_ = false;
         return;
@@ -1048,13 +1110,13 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
     }
     if (sym == FcitxKey_BackSpace) {
         uic_.backspacePress();
-        if (uic_.backspaces() == 0 || committedChars_ == 0) {
-            committedChars_ = 0;
+        if (uic_.backspaces() == 0 || committedText_.empty()) {
+            committedText_.clear();
             uic_.resetBuf();
             mayRebuildStateFromSurroundingText_ = false;
             return;
         }
-        if (committedChars_ <= uic_.backspaces()) {
+        if (committedChars() <= uic_.backspaces()) {
             autoCommit_ = true;
         }
         directCommitSync();
@@ -1071,7 +1133,7 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
     if (sym >= FcitxKey_KP_Multiply && sym <= FcitxKey_KP_9) {
         uic_.filter(0);
         directCommitSync();
-        committedChars_ = 0;
+        committedText_.clear();
         uic_.resetBuf();
         mayRebuildStateFromSurroundingText_ = false;
         return;
@@ -1088,7 +1150,7 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
                 autoCommit_ = true;
                 auto ch = utf8::UCS4ToUTF8(sym);
                 ic_->commitString(ch);
-                committedChars_++;
+                committedText_.append(ch);
                 keyEvent.filterAndAccept();
                 return;
             }
@@ -1103,7 +1165,7 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
             uic_.putChar(sym);
             auto ch = std::string(sym == FcitxKey_w ? "w" : "W");
             ic_->commitString(ch);
-            committedChars_++;
+            committedText_.append(ch);
             keyEvent.filterAndAccept();
             return;
         }
@@ -1125,8 +1187,8 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
             // hasn't reached us yet; suppress rebuild so the engine doesn't
             // incorrectly re-enter the just-committed word on the next key.
             mayRebuildStateFromSurroundingText_ = false;
-            if (committedChars_ > 0) {
-                committedChars_ = 0;
+            if (!committedText_.empty()) {
+                committedText_.clear();
                 uic_.resetBuf();
             }
         }
@@ -1138,7 +1200,7 @@ void UnikeyState::directCommitPreedit(KeyEvent &keyEvent) {
     // Non-processed key
     uic_.filter(0);
     directCommitSync();
-    committedChars_ = 0;
+    committedText_.clear();
     uic_.resetBuf();
     mayRebuildStateFromSurroundingText_ = false;
 }
